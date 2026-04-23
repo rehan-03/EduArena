@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import { createMcqAttempts, createQuizSession, getQuestionsBySubject } from '../lib/supabaseApi'
+import { createMcqAttempts, createQuizSession, getQuestionsBySubject, generateQuestions } from '../lib/supabaseApi'
+import { saveAttempt } from '../lib/localStore'
 
 const buildQuestionBank = (questions) =>
   questions.reduce((acc, question) => {
@@ -53,10 +54,19 @@ export const useQuizStore = create((set, get) => ({
   loading: false,
   error: null,
   saveError: null,
+  currentQuestionNumber: 1,
+  totalQuestions: 0,
 
-  startQuiz: async ({ subject, durationSec, questionCount = 20 }) => {
+  startQuiz: async ({ subject, durationSec, questionCount = 20, customQuestions = null }) => {
     set({ loading: true, error: null, saveError: null })
-    const matchingQuestions = await getQuestionsBySubject(subject)
+    
+    let matchingQuestions
+    if (customQuestions && customQuestions.length > 0) {
+      matchingQuestions = customQuestions
+    } else {
+      matchingQuestions = await getQuestionsBySubject(subject)
+    }
+    
     const cappedCount =
       questionCount === 'all'
         ? matchingQuestions.length
@@ -81,6 +91,8 @@ export const useQuizStore = create((set, get) => ({
       attemptedIds: firstId ? [firstId] : [],
       answersById: {},
       questionBank,
+      currentQuestionNumber: 1,
+      totalQuestions: selectedQuestions.length,
       result: firstId
         ? null
         : {
@@ -125,6 +137,7 @@ export const useQuizStore = create((set, get) => ({
       questionQueue: nextQueue,
       visitedStack: [...state.visitedStack, currentQuestionId],
       attemptedIds: attemptedSet.has(nextId) ? state.attemptedIds : [...state.attemptedIds, nextId],
+      currentQuestionNumber: state.currentQuestionNumber + 1,
     }))
   },
 
@@ -167,6 +180,9 @@ export const useQuizStore = create((set, get) => ({
     const { correctCount, attemptedCount } = scoreQuiz(answersById, questionBank)
     const timeTakenSec = startTimeMs ? Math.floor((Date.now() - startTimeMs) / 1000) : 0
     const total = Object.keys(questionBank).length
+
+    // Persist locally — updates Dashboard + Leaderboard immediately
+    saveAttempt({ subject: activeSubject, score: correctCount, total, timeTakenSec })
 
     set({
       status: 'completed',
@@ -221,10 +237,42 @@ export const useQuizStore = create((set, get) => ({
       loading: false,
       error: null,
       saveError: null,
+      currentQuestionNumber: 1,
+      totalQuestions: 0,
     }),
 
   getCurrentQuestion: () => {
     const { currentQuestionId, questionBank } = get()
     return currentQuestionId ? questionBank[currentQuestionId] ?? null : null
+  },
+
+  generateNewQuestions: async ({ count = 10 } = {}) => {
+    const { activeSubject } = get()
+    set({ loading: true, error: null })
+
+    const unitTopicMap = {
+      DSA: ['Arrays', 'Stacks', 'Queues', 'Linked Lists', 'Trees', 'Graphs', 'Sorting', 'Searching'],
+      OS: ['Process Management', 'Memory Management', 'Scheduling', 'Deadlocks', 'File Systems', 'I/O Management'],
+      CN: ['OSI Model', 'TCP/IP', 'IP Addressing', 'Routing', 'Transport Layer', 'Network Security'],
+      DBMS: ['ER Model', 'Normalization', 'Transactions', 'SQL', 'Keys', 'Indexing'],
+    }
+
+    const units = unitTopicMap[activeSubject] || ['General']
+    const randomUnit = units[Math.floor(Math.random() * units.length)]
+
+    const { questions: newQuestions, error } = await generateQuestions({
+      subject: activeSubject,
+      unit: randomUnit,
+      count,
+      difficulty: 'medium',
+    })
+
+    if (error || !newQuestions?.length) {
+      set({ loading: false, error: error || 'Failed to generate new questions' })
+      return { questions: [], error }
+    }
+
+    set({ loading: false })
+    return { questions: newQuestions, error: null }
   },
 }))

@@ -235,3 +235,13 @@ a {
   background: #fee2e2;
   color: #991b1b;
 }
+
+.question-progress {
+  float: right;
+  font-weight: 600;
+  color: var(--primary);
+  background: var(--primary-light);
+  padding: 0.25rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.875rem;
+}

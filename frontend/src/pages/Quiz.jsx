@@ -13,6 +13,8 @@ function Quiz() {
   const [durationSec, setDurationSec] = useState(300)
   const [questionCount, setQuestionCount] = useState(20)
   const [availableCount, setAvailableCount] = useState(0)
+  const [newQuestions, setNewQuestions] = useState([])
+  const [generating, setGenerating] = useState(false)
 
   const {
     status,
@@ -22,6 +24,8 @@ function Quiz() {
     result,
     loading,
     saveError,
+    currentQuestionNumber,
+    totalQuestions,
     startQuiz,
     getCurrentQuestion,
     selectAnswer,
@@ -30,6 +34,7 @@ function Quiz() {
     submitQuiz,
     tick,
     resetQuiz,
+    generateNewQuestions,
   } = useQuizStore()
 
   const question = getCurrentQuestion()
@@ -144,6 +149,8 @@ function Quiz() {
           <QuizCard
             question={question}
             selectedIndex={selectedIndex}
+            questionNumber={currentQuestionNumber}
+            totalQuestions={totalQuestions}
             onSelect={(index) => selectAnswer(index)}
           />
           <QuizNavigator
@@ -161,10 +168,34 @@ function Quiz() {
           <p className="lead">{resultMessage}</p>
           {saveError && <p className="muted">Saved locally, but sync failed: {saveError}</p>}
           <div className="actions-row">
+            <button type="button" className="primary" onClick={async () => {
+              setGenerating(true)
+              const { questions, error } = await generateNewQuestions({ count: 10 })
+              if (error) {
+                setGenerating(false)
+                return
+              }
+              setNewQuestions(questions)
+              setGenerating(false)
+            }} disabled={generating}>
+              {generating ? 'Generating...' : 'Generate New Questions'}
+            </button>
             <button type="button" className="ghost" onClick={resetQuiz}>
               Start New Quiz
             </button>
           </div>
+          {newQuestions.length > 0 && (
+            <div className="card" style={{ marginTop: '1rem' }}>
+              <h4>New Questions Generated ({newQuestions.length})</h4>
+              <p className="muted">Click "Start Quiz with New Questions" to begin a new quiz with these AI-generated questions.</p>
+              <button type="button" className="primary" onClick={() => {
+                startQuiz({ subject, durationSec, questionCount: newQuestions.length, customQuestions: newQuestions })
+                setNewQuestions([])
+              }} disabled={loading}>
+                Start Quiz with New Questions
+              </button>
+            </div>
+          )}
         </div>
       )}
     </section>

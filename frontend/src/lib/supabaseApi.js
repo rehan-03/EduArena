@@ -1,7 +1,12 @@
-import { SUBJECTS, attemptHistory, leaderboardRows, quizQuestions, subjectProgress, weakUnits } from '../data/mockData'
+import { SUBJECTS, attemptHistory, codingProblems as mockCodingProblems, leaderboardRows, quizQuestions, subjectProgress, weakUnits } from '../data/mockData'
 import { isSupabaseConfigured, supabase } from './supabaseClient'
-import { judgeCode } from './judgeApi'
+import { judgeCode, runCode } from './judgeApi'
 import { generateQuestions as generateGroqQuestions, isGroqConfigured } from './groqApi'
+import { getLocalDashboardData, getLocalLeaderboardRows } from './localStore'
+
+export { runCode } from './judgeApi'
+
+export { generateQuestions } from './groqApi'
 
 const OPTION_INDEX_TO_CHAR = ['A', 'B', 'C', 'D']
 const OPTION_CHAR_TO_INDEX = { A: 0, B: 1, C: 2, D: 3 }
@@ -32,24 +37,7 @@ const sortLeaderboard = (rows) =>
     return a.timeTakenSec - b.timeTakenSec
   })
 
-const fallbackCodingProblems = [
-  {
-    id: 'fallback-problem-1',
-    subject: 'Data Structures',
-    title: 'Reverse A String',
-    description: 'Given a string, return it in reverse order.',
-    difficulty: 'easy',
-    sampleInput: 'hello',
-    sampleOutput: 'olleh',
-    timeLimitMs: 2000,
-    testCases: [
-      { input: 'hello', expectedOutput: 'olleh' },
-      { input: 'world', expectedOutput: 'dlrow' },
-      { input: 'a', expectedOutput: 'a' },
-      { input: 'abc', expectedOutput: 'cba' },
-    ],
-  },
-]
+const fallbackCodingProblems = mockCodingProblems
 
 const fallbackCodeSubmissions = []
 
@@ -190,14 +178,24 @@ const supplementQuestionsWithAI = async (existingQuestions, subjectName, current
   }
 }
 
+// Maps quiz short-labels to exact 'title' values stored in the subjects table
+const SUBJECT_LABEL_MAP = {
+  'DSA':  'Data Structures',
+  'OS':   'Operating Systems',
+  'CN':   'Data Communication and Networking',
+  'DBMS': 'Database Management Systems',
+  // pass-through for values already using full names
+}
+
 const resolveSubjectId = async (subjectName) => {
-  if (!supabase) {
-    return null
-  }
-  const { data, error } = await supabase.from('subjects').select('id').eq('title', subjectName).maybeSingle()
-  if (error || !data) {
-    return null
-  }
+  if (!supabase) return null
+  const title = SUBJECT_LABEL_MAP[subjectName] ?? subjectName
+  const { data, error } = await supabase
+    .from('subjects')
+    .select('id')
+    .ilike('title', title)          // case-insensitive match
+    .maybeSingle()
+  if (error || !data) return null
   return data.id
 }
 
@@ -216,7 +214,9 @@ export const createQuizSession = async ({
 
   const subjectId = await resolveSubjectId(subjectName)
   if (!subjectId) {
-    return { sessionId: null, error: `Subject '${subjectName}' is missing in database.` }
+    // Subject not yet seeded in DB — skip sync silently (score already saved locally)
+    console.warn(`[EduArena] Subject '${subjectName}' not found in DB. Run sem4_schema.sql to seed subjects.`)
+    return { sessionId: null, error: null }
   }
 
   const startedAtIso = startedAtMs ? new Date(startedAtMs).toISOString() : new Date().toISOString()
@@ -271,9 +271,11 @@ export const createMcqAttempts = async ({ sessionId, answersById, questionsById 
   return { error: error?.message ?? null }
 }
 
-export const getLeaderboardRows = async ({ subject = 'All', batchYear = 'All' } = {}) => {
+export const getLeaderboardRows = async ({ subject = 'All', batchYear = 'All', displayName = 'You' } = {}) => {
   if (!isSupabaseConfigured || !supabase) {
-    return sortLeaderboard(leaderboardRows)
+    const localRows = getLocalLeaderboardRows(displayName)
+    const base = sortLeaderboard(leaderboardRows)
+    return localRows.length ? sortLeaderboard([...base, ...localRows]) : base
   }
 
   let query = supabase
@@ -305,7 +307,11 @@ export const getLeaderboardRows = async ({ subject = 'All', batchYear = 'All' } 
     })
     .filter((row) => (batchYear === 'All' ? true : String(row.batchYear) === batchYear))
 
-  return normalizedRows.length ? sortLeaderboard(normalizedRows) : sortLeaderboard(leaderboardRows)
+  // Inject local attempts so guest quiz results appear on the leaderboard
+  const localRows = getLocalLeaderboardRows(displayName)
+
+  const allRows = [...normalizedRows, ...localRows]
+  return allRows.length ? sortLeaderboard(allRows) : sortLeaderboard(leaderboardRows)
 }
 
 export const subscribeToLeaderboard = ({ subject, batchYear, onChange }) => {
@@ -326,9 +332,12 @@ export const subscribeToLeaderboard = ({ subject, batchYear, onChange }) => {
   }
 }
 
-export const getDashboardData = async ({ studentId }) => {
-  if (!studentId || !isSupabaseConfigured || !supabase) {
-    return { attempts: attemptHistory, progressRows: subjectProgress, weakUnitRows: weakUnits }
+export const getDashboardData = async ({ studentId, displayName } = {}) => {
+  // Always try local store first — it has real quiz results even for guests
+  const localData = getLocalDashboardData()
+
+  if (!studentId || !isSupabaseConfigured || !supabase || studentId === 'guest-local') {
+    return localData ?? { attempts: attemptHistory, progressRows: subjectProgress, weakUnitRows: weakUnits }
   }
 
   const { data: sessions, error: sessionsError } = await supabase
@@ -408,9 +417,9 @@ export const getDashboardData = async ({ studentId }) => {
   })()
 
   return {
-    attempts: attempts.length ? attempts : attemptHistory,
-    progressRows: progressRows.length ? progressRows : subjectProgress,
-    weakUnitRows,
+    attempts: attempts.length ? attempts : (localData?.attempts ?? attemptHistory),
+    progressRows: progressRows.length ? progressRows : (localData?.progressRows ?? subjectProgress),
+    weakUnitRows: weakUnitRows.length ? weakUnitRows : (localData?.weakUnitRows ?? weakUnits),
   }
 }
 
@@ -458,77 +467,89 @@ export const getCodingProblems = async ({ subjectId = 'All', difficulty = 'All' 
     .limit(100)
 
   if (subjectId !== 'All') {
-    query = query.eq('subject_id', subjectId)
+    query = query.eq('subjects.title', subjectId)
   }
   if (difficulty !== 'All') {
     query = query.eq('difficulty', difficulty)
   }
 
+
   const { data, error } = await query
-  if (error || !data) {
-    return fallbackCodingProblems
+  if (error || !data || !data.length) {
+    // Filter fallback by subject/difficulty if needed
+    let fb = fallbackCodingProblems
+    if (subjectId !== 'All') {
+      const subTitle = typeof subjectId === 'string' && !subjectId.match(/^\d+$/)
+        ? subjectId
+        : null
+      if (subTitle) fb = fb.filter((p) => p.subject === subTitle)
+    }
+    if (difficulty !== 'All') {
+      fb = fb.filter((p) => p.difficulty === difficulty)
+    }
+    return fb
   }
 
-  return data.map((row) => ({
-    id: row.id,
-    subject: row.subjects?.title ?? 'Unknown',
-    title: row.title,
-    description: row.description,
-    difficulty: row.difficulty,
-    sampleInput: row.sample_input,
-    sampleOutput: row.sample_output,
-    timeLimitMs: row.time_limit_ms,
-  }))
+  return data.map((row) => {
+    // Try to find matching fallback for test cases (DB rows may lack them)
+    const fallback = fallbackCodingProblems.find((fp) => fp.title === row.title)
+    return {
+      id: row.id,
+      subject: row.subjects?.title ?? 'Unknown',
+      title: row.title,
+      description: row.description,
+      difficulty: row.difficulty,
+      sampleInput: row.sample_input,
+      sampleOutput: row.sample_output,
+      timeLimitMs: row.time_limit_ms,
+      testCases: fallback?.testCases ?? [],
+    }
+  })
 }
 
+
 export const submitCodeSolution = async ({ studentId, problemId, language, code, testCases = [] }) => {
-  const mockFallback = () => {
-    const verdict = code.trim().length > 20 ? 'accepted' : 'wrong_answer'
-    const submission = {
-      id: `mock-${Date.now()}`,
-      studentId: studentId ?? 'guest-local',
-      problemId,
-      language,
-      verdict,
-      submittedAt: new Date().toISOString(),
-      problemTitle: fallbackCodingProblems.find((item) => item.id === problemId)?.title ?? 'Coding Problem',
+  const judgeAndRecord = async (saveToDb) => {
+    let judgeResult = null
+    if (testCases.length > 0) {
+      try {
+        judgeResult = await judgeCode({ code, language, testCases })
+      } catch {
+        console.warn('Judge failed')
+      }
     }
-    fallbackCodeSubmissions.unshift(submission)
-    fallbackCodeSubmissions.splice(20)
-    return {
-      submissionId: submission.id,
-      verdict: submission.verdict,
-      submittedAt: submission.submittedAt,
-      error: null,
+    const verdict = judgeResult?.verdict ?? (code.trim().length > 20 ? 'accepted' : 'wrong_answer')
+
+    if (!saveToDb) {
+      const submission = {
+        id: `mock-${Date.now()}`,
+        studentId: studentId ?? 'guest-local',
+        problemId,
+        language,
+        verdict,
+        judgeResult,
+        submittedAt: new Date().toISOString(),
+        problemTitle: fallbackCodingProblems.find((item) => item.id === problemId)?.title ?? 'Coding Problem',
+      }
+      fallbackCodeSubmissions.unshift(submission)
+      fallbackCodeSubmissions.splice(20)
+      return { submissionId: submission.id, verdict, submittedAt: submission.submittedAt, error: null, judgeResult }
     }
+    return { verdict, judgeResult }
   }
 
-  if (!isSupabaseConfigured || !supabase) {
-    return mockFallback()
+  if (!isSupabaseConfigured || !supabase || !studentId) {
+    // No Supabase or guest user — store in memory
+    return judgeAndRecord(false)
   }
 
-  if (!studentId) {
-    return { submissionId: null, error: 'Sign in to submit code.' }
-  }
-
-  let judgeResult = null
-  const useJudgeServer = testCases.length > 0
-
-  if (useJudgeServer) {
-    try {
-      judgeResult = await judgeCode({ code, language, testCases })
-    } catch {
-      console.warn('Judge server unavailable, using mock verdict')
-    }
-  }
-
-  const verdict = (useJudgeServer && judgeResult?.verdict) ? judgeResult.verdict : 'pending'
+  const { verdict, judgeResult } = await judgeAndRecord(true)
 
   const { data, error } = await supabase
     .from('code_submissions')
     .insert({
       student_id: studentId,
-      problem_id: problemId,
+      problem_id: UUID_REGEX.test(String(problemId)) ? problemId : null,
       language,
       code,
       verdict,
@@ -545,6 +566,7 @@ export const submitCodeSolution = async ({ studentId, problemId, language, code,
     verdict: data.verdict,
     submittedAt: data.submitted_at,
     error: null,
+    judgeResult,
   }
 }
 
